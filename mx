@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+
+# Development container image (without tag)
+DEVCTR_IMAGE_NO_TAG="public.mahesh/mahesh-maximus/mdb"
+
+# Development container tag
+DEVCTR_IMAGE_TAG="v1"
+
+# Name of the devctr.
+MDB_DEVCTR_NAME="mdb"
+
+# Full path to the Valcan tools dir on the host.
+MDB_TOOLS_DIR=$(cd "$(dirname "$0")" && pwd)
+
+# Full path to the Valcan sources dir on the host.
+MDB_ROOT_DIR=$(cd "${MDB_TOOLS_DIR}/.." && pwd)
+
+# Full path to devctr dir on the host.
+MDB_DEVCTR_DIR="${MDB_ROOT_DIR}/tools/devctr"
+
+# Full path to the Firecracker sources dir, as bind-mounted in the container.
+CTR_MDB_ROOT_DIR="/mdb"
+
+# Full path to the build dir, as bind-mounted in the container.
+CTR_MDB_BUILD_DIR="${CTR_MDB_ROOT_DIR}/build"
+
+# Development container image (name:tag)
+# This should be updated whenever we upgrade the development container.
+# (Yet another step on our way to reproducible builds.)
+DEVCTR_IMAGE="${DEVCTR_IMAGE_NO_TAG}:${DEVCTR_IMAGE_TAG}"
+
+# Full path to the Firecracker tools dir on the host.
+FC_TOOLS_DIR=$(cd "$(dirname "$0")" && pwd)
+source "$FC_TOOLS_DIR/functions"
+
+# Full path to the Firecracker sources dir on the host.
+FC_ROOT_DIR=$(cd "${FC_TOOLS_DIR}/.." && pwd)
+
+# Full path to devctr dir on the host.
+FC_DEVCTR_DIR="${FC_ROOT_DIR}/mx/devctr"
+
+cmd_init_docker() {
+   say "Init docker"
+   say "Updating os"   
+   say "->"
+   apt-get update
+   say ""
+
+   say "Installing docker"
+   say "->"
+   apt-get -y install docker.io
+   say ""
+
+   say "Start the Docker daemon"
+   say "->"
+   systemctl start docker
+   say "" 
+
+   say "Add your user to the docker group"
+   usermod -aG docker $USER
+   say ""
+
+   say "Set Docker started automatically after boot"
+   say "->"
+   systemctl enable docker
+   say ""
+
+   say "Testing your Docker configuration by running a lightweight test container and checking for net connectivity"
+   say "->"
+   docker pull alpine
+   docker run --rm -it alpine ping -c 3 amazon.com   
+}
+
+# Check if Docker is available and exit if it's not.
+# Upon returning from this call, the caller can be certain Docker is available.
+#
+ensure_docker() {
+    say "Ensuring docker is available"
+
+    NEWLINE=$'\n'
+    output=$(which docker 2>&1)
+    ok_or_die "Docker not found. Aborting." \
+        "Please make sure you have Docker (http://docker.com) installed" \
+        "and properly configured.${NEWLINE}" \
+        "Error: $?, command output: ${output}"
+
+    output=$(docker ps 2>&1)
+    ok_or_die "Error accessing Docker. Please make sure the Docker daemon" \
+        "is running and that you are part of the docker group.${NEWLINE}" \
+        "Error: $?, command output: ${output}${NEWLINE}" \
+        "For more information, see" \
+        "https://docs.docker.com/install/linux/linux-postinstall/"
+}
+
+# Run a command and retry multiple times if it fails. Once it stops
+# failing return to normal execution. If there are "retry count"
+# failures, set the last error code.
+# $1 - command
+# $2 - retry count
+# $3 - sleep interval between retries
+retry_cmd() {
+    command=$1
+    retry_cnt=$2
+    sleep_int=$3
+
+    {
+        $command
+    } || {
+        # Command failed, substract one from retry_cnt
+        retry_cnt=$((retry_cnt - 1))
+
+        # If retry_cnt is larger than 0, sleep and call again
+        if [ "$retry_cnt" -gt 0 ]; then
+            echo "$command failed, retrying..."
+            sleep "$sleep_int"
+            retry_cmd "$command" "$retry_cnt" "$sleep_int"
+        fi
+    }
+}
+
+# Attempt to download our Docker image. Exit if that fails.
+# Upon returning from this call, the caller can be certain our Docker image is
+# available on this system.
+#
+ensure_devctr() {
+   say "Ensuring dev container ..."
+    # We depend on having Docker present.
+    ensure_docker
+
+    # Check if we have the container image available locally. Attempt to
+    # download it, if we don't.
+    [[ $(docker images -q "$DEVCTR_IMAGE" | wc -l) -gt 0 ]] || {
+        say "About to pull docker image $DEVCTR_IMAGE"
+        get_user_confirmation || die "Aborted."
+
+        # Run docker pull 5 times in case it fails - sleep 3 seconds
+        # between attempts
+        #retry_cmd "docker pull $DEVCTR_IMAGE" 5 3
+	retry_cmd cmd_build_devctr 5 3
+
+        ok_or_die "Error pulling docker image. Aborting."
+    }
+}
+
+# Make sure the build/ dirs are available. Exit if we can't create them.
+# Upon returning from this call, the caller can be certain the build/ dirs exist.
+#
+ensure_build_dir() {
+    for dir in "$FC_BUILD_DIR" "$CARGO_TARGET_DIR" \
+               "$CARGO_REGISTRY_DIR" "$CARGO_GIT_REGISTRY_DIR"; do
+        create_dir "$dir"
+    done
+}
+
+# Fix build/ dir permissions after a privileged container run.
+# Since the privileged container runs as root, any files it creates will be
+# owned by root. This fixes that by recursively changing the ownership of build/
+# to the current user.
+#
+cmd_fix_perms() {
+    say "fixing perms"
+
+    # Yes, running Docker to get elevated privileges, just to chown some files
+    # is a dirty hack.
+    #run_devctr \
+       # -- \
+       # chown -R "$(id -u):$(id -g)" "$CTR_MDB_BUILD_DIR"
+
+    say "perms fixed"
+}
+
+# Builds the development container from its Dockerfile.
+#
+cmd_build_devctr() {
+    say "Building dev container"	
+    arch=$(uname -m)
+    docker_file_name="Dockerfile.$arch"
+    build_args="--build-arg TMP_POETRY_DIR=$CTR_POETRY_TMP_DIR"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            "-h"|"--help")      { cmd_help; exit 1; } ;;
+            "-n"|"--no-python-package-upgrade")
+                shift
+                build_args="$build_args --build-arg POETRY_LOCK_PATH=tools/devctr/poetry.lock"
+                ;;
+            "--")               { shift; break;     } ;;
+            *)
+                die "Unknown argument: $1. Please use --help for help."
+            ;;
+        esac
+        shift
+    done
+
+    docker build -t "$DEVCTR_IMAGE" -f "$FC_DEVCTR_DIR/$docker_file_name" .
+
+    # Copy back the lockfile, since a new dependency or version would have
+    # updated it.
+    # copy_poetry_lockfile
+}
+
+# Validate the user supplied kernel version number.
+# It must be composed of 2 groups of integers separated by dot, with an optional third group.
+validate_kernel_version() {
+    local version_regex="^([0-9]+.)[0-9]+(.[0-9]+)?$"
+    version="$1"
+
+    if [ -z "$version" ]; then
+        die "Kernel version cannot be empty."
+    elif [[ ! "$version" =~ $version_regex ]]; then
+        die "Invalid version number: $version (expected: \$Major.\$Minor.\$Patch(optional))."
+    fi
+
+}
+
+get_branch() {
+    echo `git rev-parse --abbrev-ref HEAD`
+}
+
+# Helper function to run the dev container.
+# Usage: run_devctr <docker args> -- <container args>
+# Example: run_devctr --privileged -- bash -c "echo 'hello world'"
+run_devctr() {
+    say "Start running dev container"
+    docker_args=()
+    ctr_args=()
+    docker_args_done=false
+    while [[ $# -gt 0 ]]; do
+        [[ "$1" = "--" ]] && {
+            docker_args_done=true
+            shift
+            continue
+        }
+        [[ $docker_args_done = true ]] && ctr_args+=("$1") || docker_args+=("$1")
+        shift
+    done
+
+    # If we're running in a terminal, pass the terminal to Docker and run
+    
+    [[ -t 0 ]] && docker_args+=("-i")
+    [[ -t 1 ]] && docker_args+=("-t")
+
+    # Finally, run the dev container
+    # Use 'z' on the --volume parameter for docker to automatically relabel the
+    # content and allow sharing between containers.
+    docker run "${docker_args[@]}" \
+        --name "$MDB_DEVCTR_NAME" \
+        --rm \
+        -p 3000:3000 \
+	-p 8000:8000 \
+        --volume /dev:/dev \
+        --volume "$MDB_ROOT_DIR:$CTR_MDB_ROOT_DIR:z" \
+        "$DEVCTR_IMAGE" "${ctr_args[@]}"
+}
+
+create_dir() {
+    # Create a dir for the provided path.
+    dir="$1"
+    mkdir -p "$dir" || die "Error: cannot create dir $dir"
+        [ -x "$dir" ] && [ -w "$dir" ] || \
+            {
+                say "Wrong permissions for $dir. Attempting to fix them ..."
+                chmod +x+w "$dir"
+            } || \
+            die "Error: wrong permissions for $dir. Should be +x+w"
+}
+
+# `$0 help`
+# Show the detailed devtool usage information.
+#
+cmd_help() {
+    echo ""
+    echo "Mahesh Debugger $(basename $0)"
+    echo "Usage: $(basename $0) [<args>] <command> [<command args>]"
+    echo ""
+    echo "Global arguments"
+    echo "    -y, --unattended         Run unattended. Assume the user would always"
+    echo "                             answer \"yes\" to any confirmation prompt."
+    echo ""
+    echo "Available commands:"
+    echo ""
+    echo "    build [--debug|--release] [-l|--libc musl|gnu] [-- [<cargo args>]]"
+    echo "        Build the Firecracker binaries."
+    echo "        Firecracker is built using the Rust build system (cargo). All arguments after --"
+    echo "        will be passed through to cargo."
+    echo "        --debug               Build the debug binaries. This is the default."
+    echo "        --release             Build the release binaries."
+    echo "        -l, --libc musl|gnu   Choose the libc flavor against which Firecracker will"
+    echo "                              be linked. Default is musl."
+    echo "        --ssh-keys            Provide the paths to the public and private SSH keys on the host"
+    echo "                              (in this particular order) required for the git authentication."
+    echo "                              It is mandatory that both keys are specified."
+    echo ""
+    echo "    build_devctr [--no-python-package-upgrade]"
+    echo "        Builds the development container from its Dockerfile."
+    echo "        -n, --no-python-package-upgrade  Do not update python packages."
+    echo ""
+    echo "    build_kernel -c|--config [-n|--nproc]"
+    echo "        Builds a kernel image custom-tailored for our CI."
+    echo "        -c, --config  Path to the config file."
+    echo "        -n, --nproc  Number of cores to use for building kernel."
+
+    echo "    build_rootfs -s|--size [--partuuid]"
+    echo "        Builds a rootfs image custom-tailored for use in our CI."
+    echo "        -s, --size      Size of the rootfs image. Defaults to 300MB.
+                                  The format is the same as that of 'truncates'."
+    echo "        -p, --partuuid  Whether to build a partuuid image."
+    echo ""
+    echo "    checkenv"
+    echo "        Performs prerequisites checks needed to execute firecracker."
+    echo ""
+    echo "    ci"
+    echo "        Run a continuous integration test run that executes the integration tests and"
+    echo "        checks that the release process works."
+    echo ""
+    echo "    create_snapshot_artifacts"
+    echo "        Runs a tool that generates snapshot artifacts for supported kernel versions."
+    echo "        Snapshot mem and state files are saved under \`snapshot_artifacts/\` directory"
+    echo ""
+    echo "    distclean"
+    echo "        Clean up the build tree and remove the docker container."
+    echo ""
+    echo "    fix_perms"
+    echo "        Fixes permissions when devtool dies in the middle of a privileged session."
+    echo ""
+    echo "    fmt"
+    echo "        Auto-format all Rust source files, to match the Firecracker requirements."
+    echo "        This should be used as the last step in every commit, to ensure that the"
+    echo "        Rust style tests pass."
+    echo ""
+    echo "    generate_syscall_tables <version>"
+    echo "        Generates the syscall tables for seccompiler, according to a given kernel version."
+    echo "        Release candidate (rc) linux versions are not allowed."
+    echo "        Outputs a rust file for each supported arch: src/seccompiler/src/syscall_table/{arch}.rs"
+    echo "        Supported architectures: x86_64 and aarch64."
+    echo ""
+    echo "    install [-p|--path] [--debug|--release]"
+    echo "      Install firecracker, jailer and seccomp binaries to /usr/local/bin or a given path."
+    echo "      Only the musl linked binaries are supported."
+    echo "        --path                Install binaries to a specified path."
+    echo "        --debug               Install the debug binaries."
+    echo "        --release             Install the release binaries. This is the default."
+    echo ""
+    echo "    help"
+    echo "        Display this help message."
+    echo ""
+    echo "    prepare_release <version>"
+    echo "        Prepare a new Firecracker release by updating the version number, crate "
+    echo "        dependencies and credits."
+    echo ""
+
+    echo ""
+    echo "    shell [--privileged]"
+    echo "        Launch the development container and open an interactive BASH shell."
+    echo "        -p, --privileged    Run the container as root, in privileged mode."
+    echo "                            Running Firecracker via the jailer requires elevated"
+    echo "                            privileges, though the build phase does not."
+    echo ""
+    echo "    tag <version>"
+    echo "        Create a git tag for the specified version. The tag message will contain "
+    echo "        the contents of CHANGELOG.md enclosed between the header corresponding to "
+    echo "        the specified version and the one corresponding to the previous version."
+    echo ""
+    echo "    test [-- [<pytest args>]]"
+    echo "        Run the Firecracker integration tests."
+    echo "        The Firecracker testing system is based on pytest. All arguments after --"
+    echo "        will be passed through to pytest."
+    echo "        -c, --cpuset-cpus cpulist    Set a dedicated cpulist to be used by the tests."
+    echo "        -m, --cpuset-mems memlist    Set a dedicated memlist to be used by the tests."
+    echo "        -r, --ramdisk size[k|m|g]    Use a ramdisk of `size` MB for
+                                               the entire test session (e.g
+                                               stored artifacts, Firecracker
+                                               binaries, logs/metrics FIFOs
+                                               and test created device files)."
+    echo ""
+    echo "    strip"
+    echo "        Strip debug symbols from the Firecracker release binaries."
+    echo ""
+
+}
+
+cmd_distclean() {
+    # List of folders to remove.
+    dirs=("target")
+
+    for dir in "${dirs[@]}"; do
+        if [ -d "$dir" ]; then
+            say "Removing $dir"
+            rm -rf "$dir"
+        fi
+    done
+
+    # Remove devctr if it exists
+    if [ $(docker images -q "$DEVCTR_IMAGE" | wc -l) -eq "1" ]; then
+        say "Removing $DEVCTR_IMAGE"
+        docker rmi -f "$DEVCTR_IMAGE"
+    fi
+}
+
+# `$0 shell` - drop to a shell prompt inside the dev container
+# Please see `$0 help` for more information.
+#
+cmd_shell() {
+    say "Running 'shell' command"
+    check_kernver
+    cmd_checkenv
+
+    # By default, we run the container as the current user.
+    privileged=false
+
+    # Parse any command line args.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            "-h"|"--help")          { cmd_help; exit 1; } ;;
+            "-p"|"--privileged")    { privileged=true;  } ;;
+              "--")               { shift; break;     } ;;
+            *)
+                die "Unknown argument: $1. Please use --help for help."
+            ;;
+        esac
+        shift
+    done
+
+    # Make sure we have what we need to continue.
+    ensure_devctr
+
+    if [[ $privileged = true ]]; then
+        # If requested, spin up a privileged container.
+        #
+        say "Dropping to a privileged shell prompt ..."
+        say "Note: $FC_ROOT_DIR is bind-mounted under $CTR_AT_ROOT_DIR"
+        say_warn "You are running as root; any files that get created under" \
+            "$CTR_AT_ROOT_DIR will be owned by root."
+
+        run_devctr \
+            --privileged \
+            --ulimit nofile=4096:4096 \
+            --ulimit memlock=-1:-1 \
+            --security-opt seccomp=unconfined \
+            --workdir "$CTR_MDB_ROOT_DIR" \
+            -- \
+            bash
+        ret=$?
+
+        # Running as root may have created some root-owned files under the build
+        # dir. Let's fix that.
+        #
+        cmd_fix_perms
+    else
+        say "Dropping to shell prompt as user $(whoami) ..."
+        say "Note: $FC_ROOT_DIR is bind-mounted under $CTR_AT_ROOT_DIR"
+        say_warn "You won't be able to run Firecracker via the jailer," \
+            "but you can still build it."
+        say "You can use \`$0 shell --privileged\` to get a root shell."
+
+        [ -w /dev/kvm ] || \
+            say_warn "WARNING: user $(whoami) doesn't have permission to" \
+                "access /dev/kvm. You won't be able to run Firecracker."
+
+        run_devctr \
+            --user "$(id -u):$(id -g)" \
+            --ulimit nofile=4096:4096 \
+            --ulimit memlock=-1:-1 \
+            --workdir "$CTR_MDB_ROOT_DIR" \
+            --env PS1="$(whoami)@\h:\w\$ " \
+            -- \
+            bash --norc
+        ret=$?
+    fi
+
+    return $ret
+}
+
+check_kernver () {
+    KERN_MAJOR=4
+    KERN_MINOR=14
+    (uname -r | awk -v MAJOR=$KERN_MAJOR -v MINOR=$KERN_MINOR '{ split($0,kver,".");
+    if( (kver[1] + (kver[2] / 100) ) <  MAJOR + (MINOR/100) )
+    {
+      exit 1;
+    } }') ||
+    say_err "FAILED: Kernel version must be >= $KERN_MAJOR.$KERN_MINOR"
+}
+
+# Check Production Host Setup
+# ../docs/prod-host-setup.md
+
+check_SMT () {
+    (grep -q "^forceoff$\|^notsupported$" \
+      /sys/devices/system/cpu/smt/control) ||
+    say_warn "WARNING: Hyperthreading ENABLED."
+}
+
+check_KPTI () {
+    (grep -q "^Mitigation: PTI$" \
+      /sys/devices/system/cpu/vulnerabilities/meltdown) || \
+    say_warn "WARNING: KPTI NOT SUPPORTED"
+}
+
+check_KSM () {
+    (grep -q "^0$" /sys/kernel/mm/ksm/run) || \
+    say_warn "WARNING: KSM ENABLED"
+}
+
+check_IBPB_IBRS () {
+    (grep -q "^Mitigation: Full generic retpoline, IBPB, IBRS_FW$"\
+      /sys/devices/system/cpu/vulnerabilities/spectre_v2) || \
+    say_warn "WARNING: retpoline, IBPB, IBRS: DISABLED."
+}
+
+check_L1TF () {
+    declare -a CONDITIONS=("Mitigation: PTE Inversion" "VMX: cache flushes")
+    for cond in "${CONDITIONS[@]}";
+    do (grep -q "$cond" /sys/devices/system/cpu/vulnerabilities/l1tf) ||
+       say_warn "WARNING: $cond: DISABLED";
+    done
+}
+
+check_swap () {
+    (grep -q "swap.img" /proc/swaps ) && \
+    say_warn "WARNING: SWAP ENABLED"
+}
+
+check_SSBD () {
+    arch=$(uname -m)
+    if [ "$arch" = "aarch64" ]; then
+        local param="ssbd=force-on"
+    elif [ "$arch" = "x86_64" ]; then
+        local param="spec_store_bypass_disable=on"
+    fi
+
+    ssbd_sysfs_file="/sys/devices/system/cpu/vulnerabilities/spec_store_bypass"
+
+    if [ -f "$ssbd_sysfs_file" ]; then
+        (grep -q "^Vulnerable" $ssbd_sysfs_file) && \
+        say_warn "WARNING: SSBD mitigation is either globally disabled or"\
+            "system does not support mitigation via prctl or seccomp. Try"\
+            "enabling it system-wide, using the \`${param}\` boot parameter."
+    else
+        say_warn "WARNING: SSBD mitigation not supported on this kernel."\
+            "View the prod-host-setup.md for more details."
+    fi
+}
+
+check_EPT() {
+    if [ "$arch" = "x86_64" ]; then
+        (grep -q "Y" /sys/module/kvm_intel/parameters/ept) || \
+        say_warn "WARNING: EPT DISABLED. Performance will be affected."
+    fi
+}
+
+check_vm() {
+    if [ $(dmesg | grep -c -i "hypervisor detected") -gt 0 ]; then
+        say_warn "WARNING: you are running in a virtual machine." \
+    "Firecracker is not well tested under nested virtualization."
+    fi
+}
+
+cmd_checkenv() {
+    # Parse any command line args.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            "-h"|"--help")      { cmd_help; exit 1; } ;;
+            *)
+                die "Unknown argument: $1. Please use --help for help."
+        ;;
+        esac
+        shift
+    done
+    PROD_DOC="../docs/prod-host-setup.md"
+    QUICKSTART="../docs/getting-started.md#prerequisites"
+    say "Checking prerequisites for running Mahesh Debugger."
+    say "Please check $QUICKSTART in case of any error."
+    check_kernver
+    check_vm
+    say "Checking Host Security Configuration."
+    say "Please check $PROD_DOC in case of any error."
+    check_KSM
+    check_IBPB_IBRS
+    check_L1TF
+    check_SMT
+    check_swap
+    check_SSBD
+    check_EPT
+}
+
+
+main() {
+    SECONDS=0		
+    say "Stating devetool"
+    say_noln "Current branch name: "
+    get_branch
+
+    if [ $# = 0 ]; then
+    die "No command provided. Please use \`$0 help\` for help."
+    fi
+
+    # Parse main command line args.
+    #
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)              { cmd_help; exit 1;     } ;;
+            -y|--unattended)        { OPT_UNATTENDED=true;  } ;;
+            -*)
+                die "Unknown arg: $1. Please use \`$0 help\` for help."
+            ;;
+            *)
+                break
+            ;;
+        esac
+        shift
+    done
+
+    # $1 is now a command name. Check if it is a valid command and, if so,
+    # run it.
+    #
+    declare -f "cmd_$1" > /dev/null
+    ok_or_die "Unknown command: $1. Please use \`$0 help\` for help."
+
+    cmd=cmd_$1
+    shift
+
+    # $@ is now a list of command-specific args
+    #
+    $cmd "$@"
+
+    echo "Elapsed Time (using \$SECONDS): $SECONDS seconds"
+}
+
+main "$@"
